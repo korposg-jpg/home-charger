@@ -1,0 +1,67 @@
+# Home charger stack for TrueNAS SCALE (Apps > Discover Apps > Custom App > Install via YAML)
+# or any Docker host: `docker compose --env-file .env up -d`.
+#
+# The charger connects to ws://<server LAN IP>:9000/ocpp/<chargePointId>.
+# The phones reach the app API at https://home-charger.<your-tailnet>.ts.net over Tailscale.
+# See docs/deploy-truenas.md.
+
+services:
+  # Tailscale sidecar: joins the tailnet as "home-charger" and serves HTTPS for the
+  # app API. The CSMS shares this container's network, so port 9000 is published here.
+  tailscale:
+    image: tailscale/tailscale:stable
+    hostname: home-charger
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_SERVE_CONFIG: /config/serve.json
+    volumes:
+      - ${DATA_DIR:-./data}/tailscale:/var/lib/tailscale
+    configs:
+      - source: ts-serve
+        target: /config/serve.json
+    ports:
+      # LAN port for the charger's OCPP connection. Keep it off the internet.
+      - "9000:9000"
+    restart: unless-stopped
+
+  csms:
+    image: ${CSMS_IMAGE:-ghcr.io/korposg-jpg/home-charger-csms:latest}
+    network_mode: service:tailscale
+    depends_on: [tailscale]
+    environment:
+      CSMS_DB_PATH: /data/csms.db
+      # Fill in once the real charger's id is known (see docs/install-day.md).
+      CSMS_ALLOWED_CHARGE_POINTS: ${CSMS_ALLOWED_CHARGE_POINTS:-}
+      CSMS_OCPP_BASIC_AUTH_PASSWORD: ${CSMS_OCPP_BASIC_AUTH_PASSWORD:-}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${DATA_DIR:-./data}/csms:/data
+    restart: unless-stopped
+
+  # Simulated DE-2 for development: `docker compose --profile sim up -d`.
+  # Drive it with http://<server>:9100/docs (plug in, swipe a card, ...).
+  simulator:
+    profiles: [sim]
+    image: ${SIM_IMAGE:-ghcr.io/korposg-jpg/home-charger-simulator:latest}
+    environment:
+      SIM_CSMS_URL: ws://tailscale:9000/ocpp
+      SIM_CHARGE_POINT_ID: DE2-SIM
+      SIM_TIME_SCALE: "10"
+    ports:
+      - "9100:9100"
+    depends_on: [csms]
+    restart: unless-stopped
+
+configs:
+  ts-serve:
+    content: |
+      {
+        "TCP": { "443": { "HTTPS": true } },
+        "Web": {
+          "$${TS_CERT_DOMAIN}:443": {
+            "Handlers": { "/": { "Proxy": "http://127.0.0.1:9000" } }
+          }
+        }
+      }
